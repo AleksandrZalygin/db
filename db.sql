@@ -1322,4 +1322,148 @@ left join measurments_height_cte as t4 on t1.id = t4.emploee_id
 order by coalesce(quantity_fails,0) asc, coalesce(min_height, 0) asc ;
 
 -- Проверка отчета
-select * from vw_report_fails_height_statistics
+select * from vw_report_fails_height_statistics;
+
+
+------------------------------------------------------------------------------
+-- Процедура для расчёта «средних» величин по Таблице 2 (температура)
+-- и Таблице 3 (скорость и направление ветра)
+------------------------------------------------------------------------------
+create or replace procedure public.sp_calc_avg_temp_and_wind(
+    -- Параметр для температуры (отклонение от некоего базового значения
+    -- или же "колонка" из Таблицы 2 — в вашем коде это число, например 3, 5, 10 и т.д.)
+    IN  par_temperature_deviation numeric(8,2),
+    -- Параметр для сноса пули (bullet_demolition_range),
+    -- используемый в Таблице 3
+    IN  par_bullet_demolition_range numeric(8,2),
+    -- Тип измерительного устройства (1 = ДМК, 2 = ВР)
+    IN  par_measurement_type_id integer,
+    -- Среднее отклонение температуры (вычислим как среднее по всем высотам Таблицы 2)
+    OUT out_avg_temperature_deviation numeric(8,2),
+    -- Средняя скорость ветра (вычислим как среднее по всем высотам Таблицы 3)
+    OUT out_avg_wind_speed numeric(8,2),
+    -- Среднее приращение направления ветра (Таблица 3, поле delta)
+    OUT out_avg_wind_direction numeric(8,2)
+)
+language plpgsql
+as $$
+declare
+    -- Массив структур, которые возвращает sp_calc_temperature_deviation
+    arr_temp_corrections temperature_correction[];
+    -- Массив структур, которые возвращает sp_calc_wind_speed_deviation
+    arr_wind_corrections wind_direction_correction[];
+
+    -- Вспомогательные переменные для суммирования и подсчёта
+    sum_temp_dev integer := 0;
+    sum_wind_speed integer := 0;
+    sum_wind_dir integer := 0;
+
+    cnt_temp integer;
+    cnt_wind integer;
+
+    rec_temp temperature_correction;
+    rec_wind wind_direction_correction;
+begin
+    --------------------------------------------------------------------------
+    -- 1) Вызываем процедуру sp_calc_temperature_deviation, которая вернёт
+    --    массив поправок температуры по всем высотам.
+    --------------------------------------------------------------------------
+    call public.sp_calc_temperature_deviation(
+        par_temperature_correction => par_temperature_deviation,
+        par_measurement_type_id    => par_measurement_type_id,
+        par_corrections            => arr_temp_corrections
+    );
+
+    -- Считаем среднее по температурным отклонениям
+    cnt_temp := array_length(arr_temp_corrections, 1);
+    if cnt_temp is null then
+        cnt_temp := 0;
+    end if;
+
+    if cnt_temp = 0 then
+        out_avg_temperature_deviation := 0;
+    else
+        foreach rec_temp in array arr_temp_corrections loop
+            sum_temp_dev := sum_temp_dev + rec_temp.temperature_deviation;
+        end loop;
+        out_avg_temperature_deviation := sum_temp_dev::numeric / cnt_temp::numeric;
+    end if;
+
+
+    --------------------------------------------------------------------------
+    -- 2) Вызываем процедуру sp_calc_wind_speed_deviation, которая вернёт
+    --    массив поправок на скорость ветра и направление (delta).
+    --------------------------------------------------------------------------
+    call public.sp_calc_wind_speed_deviation(
+        par_bullet_demolition_range => par_bullet_demolition_range,
+        par_measurement_type_id     => par_measurement_type_id,
+        par_corrections             => arr_wind_corrections
+    );
+
+    cnt_wind := array_length(arr_wind_corrections, 1);
+    if cnt_wind is null then
+        cnt_wind := 0;
+    end if;
+
+    if cnt_wind = 0 then
+        out_avg_wind_speed := 0;
+        out_avg_wind_direction := 0;
+    else
+        foreach rec_wind in array arr_wind_corrections loop
+            sum_wind_speed := sum_wind_speed + rec_wind.wind_speed_deviation;
+            sum_wind_dir   := sum_wind_dir   + rec_wind.wind_deviation;
+        end loop;
+
+        out_avg_wind_speed     := sum_wind_speed::numeric / cnt_wind::numeric;
+        out_avg_wind_direction := sum_wind_dir::numeric   / cnt_wind::numeric;
+    end if;
+end;
+$$;
+-------------------------------------------------------------------------------
+-- Тестовый вызов процедуры sp_calc_avg_temp_and_wind
+-------------------------------------------------------------------------------
+do $$
+declare
+    v_avg_temp numeric(8,2);
+    v_avg_wind_speed numeric(8,2);
+    v_avg_wind_dir numeric(8,2);
+begin
+    raise notice '----------------------------------------------';
+    raise notice 'Тест расчёта средних поправок (Таблица 2 и 3)';
+    raise notice '----------------------------------------------';
+
+    -- Пример: вызываем для ВР (measurement_type_id = 2),
+    --         температура = 3, снос пули = 14
+    call public.sp_calc_avg_temp_and_wind(
+        3,               -- par_temperature_deviation
+        14,              -- par_bullet_demolition_range
+        2,               -- Ветровое ружье
+        v_avg_temp,      -- OUT среднее отклонение температуры
+        v_avg_wind_speed,-- OUT средняя скорость ветра
+        v_avg_wind_dir   -- OUT среднее приращение направления ветра
+    );
+
+    raise notice 'Результат для ВР (type=2), temp=3, demolition=14:';
+    raise notice '  Среднее отклонение температуры = %', v_avg_temp;
+    raise notice '  Средняя скорость ветра         = %', v_avg_wind_speed;
+    raise notice '  Среднее приращение направления = %', v_avg_wind_dir;
+
+    -- Пример: вызываем для ДМК (measurement_type_id = 1),
+    --         температура = 5, снос пули = 20
+    call public.sp_calc_avg_temp_and_wind(
+        5,               -- par_temperature_deviation
+        20,              -- par_bullet_demolition_range
+        1,               -- ДМК
+        v_avg_temp,
+        v_avg_wind_speed,
+        v_avg_wind_dir
+    );
+
+    raise notice 'Результат для ДМК (type=1), temp=5, demolition=20:';
+    raise notice '  Среднее отклонение температуры = %', v_avg_temp;
+    raise notice '  Средняя скорость ветра         = %', v_avg_wind_speed;
+    raise notice '  Среднее приращение направления = %', v_avg_wind_dir;
+
+    raise notice '----------------------------------------------';
+end $$;
+
